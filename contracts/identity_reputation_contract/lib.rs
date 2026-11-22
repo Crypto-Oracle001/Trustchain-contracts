@@ -525,8 +525,22 @@ impl IdentityReputationContract {
     /// land while a driver is suspended, otherwise suspension would shield
     /// wrongdoers from punishment. Only the reputation-minting entry points
     /// (`increase_reputation`, `award_reputation`) freeze on suspension.
+    ///
+    /// The emitted `ReputationDecreasedEvent` carries the dispute context so
+    /// indexers can attribute the penalty to the case that caused it:
+    /// `delivery_id` identifies the delivery under dispute, `reason` is a
+    /// caller-supplied reason code (e.g. the dispute ruling), `actor` is the
+    /// authenticated caller that applied the penalty, and `resulting_score` is
+    /// the driver's reputation score after the deduction.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
-    pub fn decrease_reputation(env: Env, caller: Address, driver: Address, points: u32) {
+    pub fn decrease_reputation(
+        env: Env,
+        caller: Address,
+        driver: Address,
+        delivery_id: u64,
+        points: u32,
+        reason: u32,
+    ) {
         let delivery_contract = Self::get_delivery_contract(env.clone());
         let dispute_contract = Self::get_dispute_contract(env.clone());
         if caller != delivery_contract && caller != dispute_contract {
@@ -545,6 +559,7 @@ impl IdentityReputationContract {
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::ProviderNotFound));
 
         profile.reputation_score = reputation_down(profile.reputation_score, points);
+        let resulting_score = profile.reputation_score;
 
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().extend_ttl(
@@ -555,7 +570,14 @@ impl IdentityReputationContract {
 
         env.events().publish(
             (events::reputation_decreased(&env),),
-            ReputationDecreasedEvent { driver, points },
+            ReputationDecreasedEvent {
+                driver,
+                delivery_id,
+                points,
+                reason,
+                actor: caller,
+                resulting_score,
+            },
         );
     }
 

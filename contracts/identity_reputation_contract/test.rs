@@ -231,7 +231,7 @@ fn test_decrease_reputation_basic() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    client.decrease_reputation(&delivery_contract, &driver, &10u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &10u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 40);
 }
@@ -242,7 +242,7 @@ fn test_reputation_cannot_go_below_zero() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    client.decrease_reputation(&delivery_contract, &driver, &200u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &200u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 0);
 }
@@ -267,7 +267,7 @@ fn test_tier_bronze() {
     client.register_driver(&driver);
 
     client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
-    client.decrease_reputation(&delivery_contract, &driver, &15u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &15u32, &None);
     let tier = client.get_driver_tier(&driver);
     assert_eq!(tier, DriverTier::Bronze);
 }
@@ -331,10 +331,10 @@ fn drive_score_to(
             score += 5;
         }
         if score > target {
-            client.decrease_reputation(authorized, driver, &(score - target));
+            client.decrease_reputation(authorized, driver, &0u64, &(score - target), &None);
         }
     } else {
-        client.decrease_reputation(authorized, driver, &(start - target));
+        client.decrease_reputation(authorized, driver, &0u64, &(start - target), &None);
     }
     assert_eq!(
         client.get_driver_profile(driver).reputation_score,
@@ -449,9 +449,9 @@ fn test_reputation_deduction_sequence() {
     client.register_driver(&driver);
 
     client.increase_reputation(&delivery_contract, &driver, &1u64, &6000u32, &true);
-    client.decrease_reputation(&dispute_contract, &driver, &3u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &3u32, &None);
     client.increase_reputation(&delivery_contract, &driver, &2u64, &1000u32, &false);
-    client.decrease_reputation(&dispute_contract, &driver, &7u32);
+    client.decrease_reputation(&dispute_contract, &driver, &2u64, &7u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 55);
@@ -576,7 +576,7 @@ fn test_admin_can_repoint_cross_contracts() {
     assert_eq!(client.get_dispute_contract(), new_dispute_contract);
 
     client.increase_reputation(&new_delivery_contract, &driver, &1u64, &1000u32, &false);
-    client.decrease_reputation(&new_dispute_contract, &driver, &2u32);
+    client.decrease_reputation(&new_dispute_contract, &driver, &1u64, &2u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 53);
@@ -673,7 +673,7 @@ fn test_authorized_third_contract_can_update_reputation() {
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 55);
 
-    client.decrease_reputation(&third_contract, &driver, &5u32);
+    client.decrease_reputation(&third_contract, &driver, &1u64, &5u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 50);
 }
@@ -746,7 +746,8 @@ fn test_deauthorized_delivery_contract_rejected_for_reputation_calls() {
         _ => panic!("Expected de-authorized increase_reputation to fail with Unauthorized"),
     }
 
-    let dec_result = client.try_decrease_reputation(&delivery_contract, &driver, &5u32);
+    let dec_result =
+        client.try_decrease_reputation(&delivery_contract, &driver, &1u64, &5u32, &None);
     match dec_result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected de-authorized decrease_reputation to fail with Unauthorized"),
@@ -790,7 +791,7 @@ fn test_unauthorized_caller_cannot_decrease_reputation() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    let result = client.try_decrease_reputation(&random, &driver, &5u32);
+    let result = client.try_decrease_reputation(&random, &driver, &1u64, &5u32, &None);
     match result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected unauthorized decrease_reputation to fail with Unauthorized"),
@@ -1227,7 +1228,7 @@ fn test_suspended_driver_still_receives_penalties() {
     client.register_driver(&driver);
     client.suspend_driver(&admin, &driver);
 
-    client.decrease_reputation(&dispute_contract, &driver, &10u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &10u32, &None);
     assert_eq!(client.get_driver_profile(&driver).reputation_score, 40);
 }
 
@@ -1286,7 +1287,7 @@ fn test_existing_flows_unaffected_for_active_drivers() {
     client.register_driver(&driver);
     client.update_driver_kyc_status(&admin, &driver, &true);
     client.increase_reputation(&delivery_contract, &driver, &1u64, &6000u32, &true);
-    client.decrease_reputation(&dispute_contract, &driver, &3u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &3u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.kyc_verified, true);
@@ -1429,4 +1430,105 @@ fn test_register_driver_emits_event_with_kyc_and_score() {
     let profile = client.get_driver_profile(&driver);
     assert!(!profile.kyc_verified);
     assert_eq!(profile.reputation_score, INITIAL_REPUTATION_SCORE);
+}
+
+// ── Issue #120: penalty events carry dispute context ────────────────────────
+
+/// Decode the most recently published event's data as a
+/// `ReputationDecreasedEvent` and return it alongside the event's topics.
+fn last_decrease_event(env: &Env) -> (soroban_sdk::Vec<Val>, ReputationDecreasedEvent) {
+    let (topics, data) = last_event(env);
+    let event = ReputationDecreasedEvent::try_from_val(env, &data)
+        .expect("event data is not a ReputationDecreasedEvent");
+    (topics, event)
+}
+
+/// A penalty attributed to a specific delivery must emit that delivery id,
+/// the actor that applied it, the points deducted and the resulting score.
+#[test]
+fn test_decrease_reputation_event_carries_delivery_and_reason() {
+    let (env, _, client, _, dispute_contract) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let delivery_id = 42u64;
+    let reason = Symbol::new(&env, "refund");
+    client.decrease_reputation(
+        &dispute_contract,
+        &driver,
+        &delivery_id,
+        &10u32,
+        &Some(reason.clone()),
+    );
+
+    assert_last_topic(&env, "reputation_decreased");
+    let (_, event) = last_decrease_event(&env);
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.delivery_id, delivery_id);
+    assert_eq!(event.reason, Some(reason));
+    assert_eq!(event.actor, dispute_contract);
+    assert_eq!(event.points, 10);
+    assert_eq!(event.resulting_score, 40);
+}
+
+/// A refund verdict and a split verdict for different deliveries each produce
+/// a penalty event attributable to its own delivery id and reason.
+#[test]
+fn test_refund_and_split_verdicts_produce_attributable_penalty_events() {
+    let (env, _, client, _, dispute_contract) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let refund_delivery = 1001u64;
+    let split_delivery = 1002u64;
+
+    client.decrease_reputation(
+        &dispute_contract,
+        &driver,
+        &refund_delivery,
+        &10u32,
+        &Some(Symbol::new(&env, "refund")),
+    );
+    let (_, refund_event) = last_decrease_event(&env);
+    assert_eq!(refund_event.delivery_id, refund_delivery);
+    assert_eq!(refund_event.reason, Some(Symbol::new(&env, "refund")));
+    assert_eq!(refund_event.actor, dispute_contract);
+    assert_eq!(refund_event.points, 10);
+    assert_eq!(refund_event.resulting_score, 40);
+
+    client.decrease_reputation(
+        &dispute_contract,
+        &driver,
+        &split_delivery,
+        &5u32,
+        &Some(Symbol::new(&env, "split")),
+    );
+    let (_, split_event) = last_decrease_event(&env);
+    assert_eq!(split_event.delivery_id, split_delivery);
+    assert_eq!(split_event.reason, Some(Symbol::new(&env, "split")));
+    assert_eq!(split_event.actor, dispute_contract);
+    assert_eq!(split_event.points, 5);
+    assert_eq!(split_event.resulting_score, 35);
+
+    // The two events are distinguishable by delivery id.
+    assert_ne!(refund_event.delivery_id, split_event.delivery_id);
+}
+
+/// Callers without a reason code still emit the delivery id and a `None`
+/// reason, so indexers can attribute the penalty to the delivery.
+#[test]
+fn test_decrease_reputation_event_without_reason() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    client.decrease_reputation(&delivery_contract, &driver, &7u64, &3u32, &None);
+
+    let (_, event) = last_decrease_event(&env);
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.delivery_id, 7u64);
+    assert_eq!(event.reason, None);
+    assert_eq!(event.actor, delivery_contract);
+    assert_eq!(event.points, 3);
+    assert_eq!(event.resulting_score, 47);
 }

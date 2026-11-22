@@ -725,6 +725,118 @@ fn test_resolve_dispute_refund_sender_by_admin() {
     assert_eq!(escrow.status, shared_types::EscrowStatus::Refunded);
 }
 
+/// Issue #120: a refund verdict must emit a `ReputationDecreasedEvent` that
+/// identifies the delivery that caused the penalty, so indexers can attribute
+/// the penalty to the dispute rather than guessing from the driver alone.
+#[test]
+fn test_refund_verdict_emits_penalty_event_with_delivery_id() {
+    use identity_reputation_contract::{
+        IdentityReputationContract, IdentityReputationContractClient, ReputationDecreasedEvent,
+        ReputationPenaltyReason,
+    };
+
+    let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    let identity_id = env.register(IdentityReputationContract, ());
+    let identity_client = IdentityReputationContractClient::new(&env, &identity_id);
+    identity_client.init(&admin, &delivery_id, &dispute_client.address);
+    dispute_client.set_identity_reputation_contract(&admin, &identity_id);
+    identity_client.register_driver(&driver);
+
+    let mut delivery_record = create_mock_delivery_record(
+        &env,
+        did(30),
+        sender.clone(),
+        recipient.clone(),
+        DeliveryStatus::Active,
+        None,
+    );
+    delivery_record.driver = Some(driver.clone());
+    set_mock_delivery(&env, &delivery_id, did(30), &delivery_record);
+
+    let escrow_record = create_mock_escrow_record(
+        sender.clone(),
+        recipient.clone(),
+        driver.clone(),
+        Address::generate(&env),
+        shared_types::EscrowStatus::Paused,
+    );
+    set_mock_escrow(&env, &escrow_id, 30, &escrow_record);
+
+    dispute_client.raise_dispute(&sender, &did(30));
+    dispute_client.resolve_dispute_refund_sender(&admin, &did(30));
+
+    let penalty = dispute_client.get_dispute_reputation_penalty();
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let event: ReputationDecreasedEvent =
+        ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.points, penalty);
+    assert_eq!(event.new_score, 50 - penalty);
+    assert_eq!(event.delivery_id, Some(did(30)));
+    assert_eq!(event.reason, Some(ReputationPenaltyReason::DisputeRefund));
+}
+
+/// Issue #120: a split verdict must emit a `ReputationDecreasedEvent` that
+/// identifies the delivery that caused the penalty, with the split reason code
+/// so indexers can distinguish it from a refund ruling.
+#[test]
+fn test_split_verdict_emits_penalty_event_with_delivery_id() {
+    use identity_reputation_contract::{
+        IdentityReputationContract, IdentityReputationContractClient, ReputationDecreasedEvent,
+        ReputationPenaltyReason,
+    };
+
+    let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
+        setup_test();
+
+    let identity_id = env.register(IdentityReputationContract, ());
+    let identity_client = IdentityReputationContractClient::new(&env, &identity_id);
+    identity_client.init(&admin, &delivery_id, &dispute_client.address);
+    dispute_client.set_identity_reputation_contract(&admin, &identity_id);
+    identity_client.register_driver(&driver);
+
+    let mut delivery_record = create_mock_delivery_record(
+        &env,
+        did(31),
+        sender.clone(),
+        recipient.clone(),
+        DeliveryStatus::Active,
+        None,
+    );
+    delivery_record.driver = Some(driver.clone());
+    set_mock_delivery(&env, &delivery_id, did(31), &delivery_record);
+
+    let escrow_record = create_mock_escrow_record(
+        sender.clone(),
+        recipient.clone(),
+        driver.clone(),
+        Address::generate(&env),
+        shared_types::EscrowStatus::Paused,
+    );
+    set_mock_escrow(&env, &escrow_id, 31, &escrow_record);
+
+    dispute_client.raise_dispute(&sender, &did(31));
+    dispute_client.resolve_dispute_split_funds(&admin, &did(31), &5000);
+
+    let penalty = dispute_client.get_dispute_split_penalty();
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let event: ReputationDecreasedEvent =
+        ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.points, penalty);
+    assert_eq!(event.new_score, 50 - penalty);
+    assert_eq!(event.delivery_id, Some(did(31)));
+    assert_eq!(event.reason, Some(ReputationPenaltyReason::DisputeSplit));
+}
+
 #[test]
 fn test_high_value_dispute_requires_two_distinct_mediators() {
     let (env, admin, sender, recipient, driver, delivery_id, escrow_id, dispute_client) =
@@ -1303,6 +1415,23 @@ fn test_integration_resolve_dispute_refund_sender_decreases_reputation() {
         50 - penalty
     );
 
+    // Issue #120: the penalty event must carry the dispute context so
+    // indexers can attribute it to the delivery and the ruling that caused it.
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let event: identity_reputation_contract::ReputationDecreasedEvent =
+        identity_reputation_contract::ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(event.driver, driver);
+    assert_eq!(event.points, penalty);
+    assert_eq!(event.new_score, 50 - penalty);
+    assert_eq!(event.delivery_id, Some(delivery_id_val));
+    assert_eq!(
+        event.reason,
+        Some(identity_reputation_contract::ReputationPenaltyReason::DisputeRefund)
+    );
+
     // The sender got their funds back; the driver's reputation is the only
     // thing that moved.
     assert_eq!(TokenClient::new(&env, &token).balance(&sender), 1000);
@@ -1750,6 +1879,23 @@ fn test_configured_values_apply_to_split_and_pay_driver_paths() {
     assert_eq!(
         identity_client.get_driver_profile(&driver).reputation_score,
         35
+    );
+
+    // Issue #120: the split verdict's penalty event is attributable to the
+    // delivery that was split, with the split reason code.
+    let (topics, data) = last_event(&env);
+    let topic0: Symbol = Symbol::try_from_val(&env, &topics.get(0).unwrap()).unwrap();
+    assert_eq!(topic0, Symbol::new(&env, "reputation_decreased"));
+    let split_event: identity_reputation_contract::ReputationDecreasedEvent =
+        identity_reputation_contract::ReputationDecreasedEvent::try_from_val(&env, &data)
+            .expect("failed to decode ReputationDecreasedEvent");
+    assert_eq!(split_event.driver, driver);
+    assert_eq!(split_event.points, 15);
+    assert_eq!(split_event.new_score, 35);
+    assert_eq!(split_event.delivery_id, Some(split_delivery));
+    assert_eq!(
+        split_event.reason,
+        Some(identity_reputation_contract::ReputationPenaltyReason::DisputeSplit)
     );
 
     // Path 2: pay-driver resolution applies the configured reward.

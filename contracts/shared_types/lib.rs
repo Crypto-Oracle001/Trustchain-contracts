@@ -677,8 +677,22 @@ pub struct ReputationIncreasedEvent {
 pub struct ReputationDecreasedEvent {
     /// Driver address whose reputation was decreased.
     pub driver: Address,
+    /// Delivery identifier the penalty is attributed to. For dispute-driven
+    /// penalties this is the delivery whose verdict triggered the decrease,
+    /// letting indexers tie the penalty back to the authenticated case.
+    pub delivery_id: u64,
+    /// Reason code describing why the penalty was applied. Dispute verdicts
+    /// use distinct codes per ruling (e.g. refund vs split) so indexers can
+    /// distinguish one ruling from another; non-dispute callers supply their
+    /// own code.
+    pub reason: u32,
+    /// Address that authorized the penalty (the authenticated caller, e.g.
+    /// the dispute resolution contract or an admin).
+    pub actor: Address,
     /// Points deducted from the driver's reputation score.
     pub points: u32,
+    /// Driver's reputation score after the deduction was applied.
+    pub resulting_score: u32,
 }
 
 #[contracttype]

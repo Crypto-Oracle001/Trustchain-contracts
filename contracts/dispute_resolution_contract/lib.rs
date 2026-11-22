@@ -46,6 +46,17 @@ const _: () = {
     assert!(DEFAULT_DISPUTE_REPUTATION_SPLIT_PENALTY <= MAX_DISPUTE_REPUTATION_PENALTY);
 };
 
+/// Reason code attached to reputation penalties caused by a refund verdict
+/// (`resolve_dispute_refund_sender`). Emitted alongside the disputed
+/// `delivery_id` so indexers can attribute the penalty to the ruling that
+/// caused it (Issue #120).
+const DISPUTE_REASON_REFUND: u32 = 1;
+
+/// Reason code attached to reputation penalties caused by a split verdict
+/// (`resolve_dispute_split_funds` and `force_resolve_dispute`). See
+/// `DISPUTE_REASON_REFUND` (Issue #120).
+const DISPUTE_REASON_SPLIT: u32 = 2;
+
 const MIN_DISPUTE_TIME_LIMIT: u64 = 86400; // 1 day in seconds
 const MAX_DISPUTE_WINDOW: u64 = 365 * 24 * 60 * 60; // 1 year
 
@@ -1060,6 +1071,8 @@ impl DisputeResolutionContract {
                     env.current_contract_address().into_val(&env),
                     driver.clone().into_val(&env),
                     penalty.into_val(&env),
+                    u64::from(delivery_id).into_val(&env),
+                    DISPUTE_REASON_REFUND.into_val(&env),
                 ],
             );
         }
@@ -1191,6 +1204,8 @@ impl DisputeResolutionContract {
                         env.current_contract_address().into_val(&env),
                         driver.clone().into_val(&env),
                         split_penalty.into_val(&env),
+                        u64::from(delivery_id).into_val(&env),
+                        DISPUTE_REASON_SPLIT.into_val(&env),
                     ],
                 );
             }
@@ -1429,6 +1444,8 @@ impl DisputeResolutionContract {
                         env.current_contract_address().into_val(&env),
                         driver.clone().into_val(&env),
                         DEFAULT_DISPUTE_REPUTATION_SPLIT_PENALTY.into_val(&env),
+                        u64::from(delivery_id).into_val(&env),
+                        DISPUTE_REASON_SPLIT.into_val(&env),
                     ],
                 );
             }
