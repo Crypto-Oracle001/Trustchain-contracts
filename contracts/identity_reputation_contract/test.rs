@@ -1430,3 +1430,107 @@ fn test_register_driver_emits_event_with_kyc_and_score() {
     assert!(!profile.kyc_verified);
     assert_eq!(profile.reputation_score, INITIAL_REPUTATION_SCORE);
 }
+
+// ── Issue #119: reputation award events report the applied score change ─────
+
+/// Decode the most recent `reputation_increased` event into its
+/// `(requested_points, applied_delta, new_score)` payload.
+fn last_reputation_increased(env: &Env) -> (u32, u32, u32) {
+    assert_last_topic(env, "reputation_increased");
+    let (_, data) = last_event(env);
+    let event = ReputationIncreasedEvent::try_from_val(env, &data)
+        .expect("failed to decode ReputationIncreasedEvent");
+    (event.points, event.applied_delta, event.new_score)
+}
+
+/// A normal (non-capped) award: the applied delta equals the requested points
+/// and the emitted resulting score matches the stored score transition.
+#[test]
+fn test_increase_reputation_event_reports_applied_delta() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let before = client.get_driver_profile(&driver).reputation_score;
+    client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+    let after = client.get_driver_profile(&driver).reputation_score;
+
+    let (requested, applied, new_score) = last_reputation_increased(&env);
+    assert_eq!(requested, 5);
+    assert_eq!(applied, requested);
+    assert_eq!(applied, after - before);
+    assert_eq!(new_score, after);
+}
+
+/// A cap-boundary award: the requested points exceed the remaining headroom,
+/// so the applied delta is the actual (smaller) score change and the emitted
+/// resulting score equals the stored score.
+#[test]
+fn test_increase_reputation_event_at_cap_reports_applied_delta() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    // Drive the score to 98, leaving only 2 points of headroom.
+    drive_score_to(&client, &delivery_contract, &driver, 98);
+    let before = client.get_driver_profile(&driver).reputation_score;
+    assert_eq!(before, 98);
+
+    // A default delivery requests 5 points, more than the 2 available.
+    client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+    let after = client.get_driver_profile(&driver).reputation_score;
+    assert_eq!(after, MAX_REPUTATION);
+
+    let (requested, applied, new_score) = last_reputation_increased(&env);
+    assert_eq!(requested, 5);
+    assert!(applied < requested, "applied delta must be capped");
+    assert_eq!(applied, after - before);
+    assert_eq!(applied, 2);
+    assert_eq!(new_score, after);
+    assert_eq!(new_score, MAX_REPUTATION);
+}
+
+/// `award_reputation` publishes the same applied-delta payload for a normal
+/// award.
+#[test]
+fn test_award_reputation_event_reports_applied_delta() {
+    let (env, _, client, _, dispute_contract) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let before = client.get_driver_profile(&driver).reputation_score;
+    client.award_reputation(&dispute_contract, &driver, &7u32);
+    let after = client.get_driver_profile(&driver).reputation_score;
+
+    let (requested, applied, new_score) = last_reputation_increased(&env);
+    assert_eq!(requested, 7);
+    assert_eq!(applied, requested);
+    assert_eq!(applied, after - before);
+    assert_eq!(new_score, after);
+}
+
+/// `award_reputation` at the cap reports the truncated applied delta and the
+/// resulting stored score.
+#[test]
+fn test_award_reputation_event_at_cap_reports_applied_delta() {
+    let (env, _, client, _, dispute_contract) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    // 50 + 45 = 95, leaving 5 points of headroom.
+    client.award_reputation(&dispute_contract, &driver, &45u32);
+    let before = client.get_driver_profile(&driver).reputation_score;
+    assert_eq!(before, 95);
+
+    client.award_reputation(&dispute_contract, &driver, &20u32);
+    let after = client.get_driver_profile(&driver).reputation_score;
+    assert_eq!(after, MAX_REPUTATION);
+
+    let (requested, applied, new_score) = last_reputation_increased(&env);
+    assert_eq!(requested, 20);
+    assert!(applied < requested, "applied delta must be capped");
+    assert_eq!(applied, after - before);
+    assert_eq!(applied, 5);
+    assert_eq!(new_score, after);
+    assert_eq!(new_score, MAX_REPUTATION);
+}

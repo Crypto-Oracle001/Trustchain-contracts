@@ -499,7 +499,10 @@ impl IdentityReputationContract {
             points = points.saturating_add(config.fragile_points);
         }
 
-        profile.reputation_score = reputation_up(profile.reputation_score, points);
+        let old_score = profile.reputation_score;
+        let new_score = reputation_up(old_score, points);
+        let applied_delta = new_score.saturating_sub(old_score);
+        profile.reputation_score = new_score;
         profile.deliveries_completed += 1;
 
         env.storage().persistent().set(&key, &profile);
@@ -515,6 +518,8 @@ impl IdentityReputationContract {
                 driver,
                 delivery_id,
                 points,
+                applied_delta,
+                new_score,
             },
         );
     }
@@ -590,7 +595,10 @@ impl IdentityReputationContract {
 
         require_driver_not_suspended(&env, &profile);
 
-        profile.reputation_score = reputation_up(profile.reputation_score, points);
+        let old_score = profile.reputation_score;
+        let new_score = reputation_up(old_score, points);
+        let applied_delta = new_score.saturating_sub(old_score);
+        profile.reputation_score = new_score;
 
         env.storage().persistent().set(&key, &profile);
         env.storage().persistent().extend_ttl(
@@ -601,7 +609,12 @@ impl IdentityReputationContract {
 
         env.events().publish(
             (events::reputation_awarded(&env),),
-            ReputationAwardedEvent { driver, points },
+            ReputationAwardedEvent {
+                driver,
+                points,
+                applied_delta,
+                new_score,
+            },
         );
     }
 
