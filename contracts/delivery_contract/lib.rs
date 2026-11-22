@@ -608,6 +608,16 @@ impl DeliveryContract {
             }
         }
 
+        // Extend instance TTL after a successful batch so the protocol's core
+        // configuration pointers (Admin, EscrowContract,
+        // IdentityReputationContract) cannot be archived while the contract is
+        // only ever used through batch creation (Issue #127). This mirrors
+        // `create_delivery` and also runs on the empty-batch path, matching the
+        // single-creation policy.
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+
         result
     }
 

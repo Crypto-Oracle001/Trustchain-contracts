@@ -1,10 +1,10 @@
 #![no_std]
 
 use shared_types::{
-    events, is_admin, ttl, DriverInvitedEvent, DriverProfile, DriverRemovedEvent,
+    events, is_admin, ttl, DriverInvitedEvent, DriverProfile, DriverRemovedEvent, DriverStatus,
     FleetDeactivatedEvent, FleetOwnerReassignedEvent, FleetReactivatedEvent, FleetRegisteredEvent,
     FleetTreasuryChangeProposedEvent, FleetTreasuryForceUpdatedEvent, FleetTreasuryUpdatedEvent,
-    TrustchainError, InviteAcceptedEvent, PayoutRoutingFallbackEvent, StorageKey,
+    TrustchainError, InviteAcceptedEvent, StorageKey,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, IntoVal,
@@ -69,6 +69,12 @@ fn require_escrow_not_paused(env: &Env) {
 /// The check is skipped when no identity contract is configured, preserving
 /// the pre-#451 behaviour for standalone deployments that do not run the
 /// identity/reputation contract at all.
+///
+/// Issue #122: the driver's `DriverProfile.status` is also inspected so that
+/// fleet acceptance enforces the same driver-status policy as delivery
+/// assignment (`assign_driver` rejects suspended drivers). Without this a
+/// suspended driver holding a pending invite could join a fleet and consume a
+/// roster slot even though they can never legally complete a delivery.
 fn require_registered_driver(env: &Env, driver: &Address) {
     let Some(identity_addr) = env
         .storage()
@@ -83,6 +89,18 @@ fn require_registered_driver(env: &Env, driver: &Address) {
         soroban_sdk::vec![env, driver.clone().into_val(env)],
     );
     if !has_profile {
+        panic_with_error!(env, FleetError::DriverNotRegistered);
+    }
+
+    // Issue #122 — reject suspended drivers, mirroring the delivery
+    // assignment policy. A reinstated driver's profile status returns to
+    // `Active`, so the same still-valid invite can then be accepted.
+    let profile: DriverProfile = env.invoke_contract(
+        &identity_addr,
+        &Symbol::new(env, "get_driver_profile"),
+        soroban_sdk::vec![env, driver.clone().into_val(env)],
+    );
+    if profile.status == DriverStatus::Suspended {
         panic_with_error!(env, FleetError::DriverNotRegistered);
     }
 }
@@ -1014,6 +1032,11 @@ impl FleetManagementContract {
     /// unregistered address into the roster would permanently waste one of
     /// the `MAX_ROSTER_SIZE`-bounded roster slots. The check is skipped when
     /// no identity contract is configured.
+    ///
+    /// Issue #122: a driver whose profile is `Suspended` is likewise rejected
+    /// with `FleetError::DriverNotRegistered`, enforcing the same status
+    /// policy as delivery assignment. A reinstated driver can accept the same
+    /// still-valid invite.
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn accept_fleet_invite(env: Env, fleet_id: u64, driver: Address) {
         env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
@@ -1247,7 +1270,14 @@ impl FleetManagementContract {
     ///
     /// Returns the fleet's treasury if the driver is an active member of that
     /// fleet, otherwise returns the driver's own address.
-    #[allow(deprecated)]
+    ///
+    /// Issue #126: this is a purely observational routing query and emits no
+    /// events. It used to publish `payout_routing_fallback` whenever an active
+    /// member's fleet was inactive or missing, so repeated simulations or
+    /// balance checks produced indistinguishable fallback events unrelated to
+    /// any real payout. The fallback event now belongs to the escrow payout
+    /// settlement path, which emits exactly one `payout_routing_fallback`
+    /// naming the escrow whenever it actually settles a fallback payout.
     pub fn get_payout_address(env: Env, driver: Address, fleet_id: u64) -> Address {
         env.storage().instance().extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
         let status: Option<DriverFleetStatus> = env
@@ -1264,21 +1294,9 @@ impl FleetManagementContract {
                 match profile {
                     Some(profile) if profile.active => profile.treasury,
                     // An inactive fleet and a missing fleet profile both fall
-                    // back to the driver's own address — publish the
-                    // routing-fallback event in both cases so off-chain
-                    // monitors can observe the downgrade.  Previously an
-                    // inactive fleet fell back silently, hiding the routing
-                    // change from event consumers.
-                    Some(_) | None => {
-                        env.events().publish(
-                            (events::payout_routing_fallback(&env),),
-                            PayoutRoutingFallbackEvent {
-                                fleet_id,
-                                driver: driver.clone(),
-                            },
-                        );
-                        driver
-                    }
+                    // back to the driver's own address. No event is emitted
+                    // here (Issue #126); the settlement path reports it.
+                    Some(_) | None => driver,
                 }
             }
             Some(DriverFleetStatus::Pending) | Some(DriverFleetStatus::Removed) | None => driver,

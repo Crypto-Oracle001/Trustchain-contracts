@@ -617,9 +617,18 @@ impl IdentityReputationContract {
         }
     }
 
+    /// Returns `true` when the driver is eligible for enterprise work.
+    ///
+    /// Eligibility reflects **both** the reputation score threshold
+    /// (`ENTERPRISE_THRESHOLD`) and the driver's current operational status:
+    /// a driver whose `DriverProfile.status` is `DriverStatus::Suspended` is
+    /// ineligible regardless of how high their score is.  Suspension is stored
+    /// separately from the score, so checking the score alone would let a
+    /// suspended high-score driver appear eligible to integrations relying on
+    /// this view.
     pub fn is_eligible_for_enterprise(env: Env, driver: Address) -> bool {
         let profile = Self::get_driver_profile(env, driver);
-        profile.reputation_score >= ENTERPRISE_THRESHOLD
+        profile.status == DriverStatus::Active && profile.reputation_score >= ENTERPRISE_THRESHOLD
     }
 
     // ── Driver suspension lifecycle ───────────────────────────────────────────
