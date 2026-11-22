@@ -27,6 +27,9 @@ pub enum DataKey {
     DisputeContract,
     EscrowContract,
     ReputationConfig,
+    /// Marks a `(driver, delivery_id)` pair as already credited so a delivery
+    /// can only ever award reputation once (Issue #118).
+    CreditedDelivery(Address, u64),
 }
 
 #[contracttype]
@@ -451,6 +454,11 @@ impl IdentityReputationContract {
     ///
     /// Rejected with `InvalidState` while the driver is suspended — a frozen
     /// profile must not gain reputation until `reinstate_driver` restores it.
+    ///
+    /// Each `(driver, delivery_id)` pair is credited at most once: a replayed
+    /// delivery ID is rejected with `DuplicateDelivery` before any state is
+    /// mutated, so neither the score nor `deliveries_completed` can be inflated
+    /// by a buggy or newly allowlisted caller (Issue #118).
     #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
     pub fn increase_reputation(
         env: Env,
@@ -478,6 +486,14 @@ impl IdentityReputationContract {
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::ProviderNotFound));
 
         require_driver_not_suspended(&env, &profile);
+
+        // Issue #118: reject replays before touching any state. The marker is
+        // only written after every validation below has passed, so a failed
+        // call never marks a delivery as credited.
+        let credited_key = DataKey::CreditedDelivery(driver.clone(), delivery_id);
+        if env.storage().persistent().has(&credited_key) {
+            panic_with_error!(&env, TrustchainError::DuplicateDelivery);
+        }
 
         let config = Self::get_reputation_config(env.clone());
 
@@ -509,6 +525,14 @@ impl IdentityReputationContract {
             ttl::LEDGER_TTL_EXTEND_TO,
         );
 
+        // Record the credited delivery so it can never be replayed.
+        env.storage().persistent().set(&credited_key, &true);
+        env.storage().persistent().extend_ttl(
+            &credited_key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+
         env.events().publish(
             (events::reputation_increased(&env),),
             ReputationIncreasedEvent {
@@ -517,6 +541,12 @@ impl IdentityReputationContract {
                 points,
             },
         );
+    }
+
+    /// Returns `true` if `delivery_id` has already credited `driver`.
+    pub fn is_delivery_credited(env: Env, driver: Address, delivery_id: u64) -> bool {
+        let key = DataKey::CreditedDelivery(driver, delivery_id);
+        env.storage().persistent().has(&key)
     }
 
     /// Penalize a driver by `points` (e.g. after an adverse dispute ruling).

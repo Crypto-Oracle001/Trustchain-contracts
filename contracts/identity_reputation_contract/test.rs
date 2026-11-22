@@ -1430,3 +1430,94 @@ fn test_register_driver_emits_event_with_kyc_and_score() {
     assert!(!profile.kyc_verified);
     assert_eq!(profile.reputation_score, INITIAL_REPUTATION_SCORE);
 }
+
+// ── Issue #118: unique-delivery credit ──────────────────────────────────────
+
+/// A first `increase_reputation` for a delivery credits the driver once,
+/// bumping both the score and the completion counter.
+#[test]
+fn test_increase_reputation_first_delivery_credits_once() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+
+    let profile = client.get_driver_profile(&driver);
+    assert_eq!(profile.reputation_score, 55);
+    assert_eq!(profile.deliveries_completed, 1);
+}
+
+/// Replaying the same delivery ID must be rejected with the typed duplicate
+/// error and leave both the score and the completion counter untouched.
+#[test]
+fn test_increase_reputation_duplicate_delivery_rejected() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+    let after_first = client.get_driver_profile(&driver);
+    assert_eq!(after_first.reputation_score, 55);
+    assert_eq!(after_first.deliveries_completed, 1);
+
+    let result =
+        client.try_increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::DuplicateDelivery.into()),
+        _ => panic!("Expected duplicate delivery ID to fail with DuplicateDelivery"),
+    }
+
+    let after_replay = client.get_driver_profile(&driver);
+    assert_eq!(after_replay.reputation_score, after_first.reputation_score);
+    assert_eq!(
+        after_replay.deliveries_completed,
+        after_first.deliveries_completed
+    );
+}
+
+/// Attributes are derived from the delivery, not from caller-supplied
+/// weight/fragile arguments: a heavy + fragile delivery yields the full
+/// base + heavy + fragile total regardless of what the caller passes.
+#[test]
+fn test_increase_reputation_attributes_derived_from_delivery() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    // Caller claims a light, non-fragile delivery; the delivery itself is
+    // heavy and fragile, so the credited total must reflect the delivery.
+    client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+
+    let profile = client.get_driver_profile(&driver);
+    // 50 (start) + 5 (base) + 3 (heavy) + 2 (fragile) = 60
+    assert_eq!(profile.reputation_score, 60);
+    assert_eq!(profile.deliveries_completed, 1);
+}
+
+/// Distinct delivery IDs for the same driver each credit exactly once.
+#[test]
+fn test_increase_reputation_distinct_deliveries_each_credit_once() {
+    let (env, _, client, delivery_contract, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
+    client.increase_reputation(&delivery_contract, &driver, &2u64, &1000u32, &false);
+    client.increase_reputation(&delivery_contract, &driver, &3u64, &1000u32, &false);
+
+    let profile = client.get_driver_profile(&driver);
+    assert_eq!(profile.reputation_score, 65);
+    assert_eq!(profile.deliveries_completed, 3);
+
+    // Replaying any of the already-credited IDs is still rejected.
+    let result =
+        client.try_increase_reputation(&delivery_contract, &driver, &2u64, &1000u32, &false);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::DuplicateDelivery.into()),
+        _ => panic!("Expected replayed delivery ID to fail with DuplicateDelivery"),
+    }
+    let after_replay = client.get_driver_profile(&driver);
+    assert_eq!(after_replay.reputation_score, 65);
+    assert_eq!(after_replay.deliveries_completed, 3);
+}
