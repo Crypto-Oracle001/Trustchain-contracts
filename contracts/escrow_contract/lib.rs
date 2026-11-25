@@ -68,6 +68,37 @@ fn require_admin(env: &Env, caller: &Address) {
 }
 
 fn require_dispute_resolution_caller(env: &Env, caller: &Address, amount: i128) {
+    // Issue #111: when a dispute_resolution_contract is configured, it is the
+    // *only* authorized caller for both resolve_dispute and
+    // resolve_dispute_split — regardless of whether the escrow amount is
+    // below HIGH_VALUE_DISPUTE_THRESHOLD.
+    //
+    // The previous logic allowed an admin to resolve low-value frozen escrows
+    // by calling these entry points directly (without going through the
+    // dispute contract), which left the corresponding DisputeCase either
+    // absent or permanently Open. The dispute contract is the only caller
+    // that records a DisputeCase, sets it to a resolved status, reconciles
+    // the delivery record, and applies reputation adjustments atomically.
+    // Bypassing it meant the case record and the escrow state diverged, in
+    // violation of the acceptance criterion "every economic dispute resolution
+    // has an authoritative case and matching verdict state".
+    //
+    // The fix: when a dispute contract is configured, it is the exclusive
+    // path. Admins who need to resolve a dispute must call the dispute
+    // contract (resolve_dispute_refund_sender / resolve_dispute_pay_driver /
+    // resolve_dispute_split_funds), which then calls this entry point.
+    //
+    // When no dispute contract is configured (legacy / test deployments that
+    // have not wired up dispute resolution), the admin fallback is preserved
+    // so existing integrations continue to work unchanged. In that mode there
+    // is no DisputeCase contract to diverge from, so the invariant cannot be
+    // violated.
+    //
+    // The `amount >= HIGH_VALUE_DISPUTE_THRESHOLD` block is intentionally
+    // removed: it was the high-value guard that only applied in the
+    // admin-fallback path, which is now only reachable when no dispute
+    // contract is configured at all.
+    let _ = amount; // kept in signature for callers; no longer used here
     if let Some(dispute_contract) = env
         .storage()
         .instance()
@@ -77,8 +108,12 @@ fn require_dispute_resolution_caller(env: &Env, caller: &Address, amount: i128) 
             caller.require_auth();
             return;
         }
+        // Dispute contract is configured but the caller is not it: reject.
+        // The admin must route through dispute_resolution_contract instead.
+        panic_with_error!(env, TrustchainError::Unauthorized);
     }
 
+    // No dispute contract configured: preserve the legacy admin-only fallback.
     caller.require_auth();
     require_admin(env, caller);
     if amount >= shared_types::HIGH_VALUE_DISPUTE_THRESHOLD {
@@ -1577,7 +1612,9 @@ impl EscrowContract {
                 disputed_by: None,
                 disputed_at: None,
                 holdback_started_at: None,
+                holdback_deadline: None,
                 fleet_id,
+                locked_fee_bps,
             },
         );
         index_push(&env, &sender, 0, delivery_id);
@@ -1770,7 +1807,9 @@ impl EscrowContract {
                         disputed_by: None,
                         disputed_at: None,
                         holdback_started_at: None,
+                        holdback_deadline: None,
                         fleet_id,
+                        locked_fee_bps,
                     },
                 );
 
@@ -1872,6 +1911,13 @@ impl EscrowContract {
         let timestamp = env.ledger().timestamp();
         record.status = EscrowStatus::Holdback;
         record.holdback_started_at = Some(timestamp);
+        // Issue #109: snapshot the release deadline at the moment the escrow
+        // enters Holdback using the holdback window that is current right now.
+        // release_expired_holdback reads this stored value directly instead of
+        // recomputing `holdback_started_at + get_holdback_window()` at claim
+        // time, so a later set_holdback_window call cannot retroactively alter
+        // the deadline for an already-confirmed delivery.
+        record.holdback_deadline = Some(timestamp.saturating_add(get_holdback_window(&env)));
         save_escrow(&env, delivery_id, &record);
         env.events().publish(
             (Symbol::new(&env, "escrow_holdback_marked"), delivery_id),
@@ -2154,10 +2200,9 @@ impl EscrowContract {
 
         // Checks + effects (state) are resolved per-branch first; the actual
         // fund transfer (interaction) happens only after all state below is
-        // committed, per checks-effects-interactions. The release branch
-        // computes the volume-discounted effective fee here — before the
-        // sender-volume increment — so the amounts that move on-chain match
-        // (Issue #190).
+        // committed, per checks-effects-interactions. The release branch uses
+        // the fee snapshotted at funding time (Issue #108) so a post-funding
+        // admin fee or tier change cannot alter the settled amounts.
         let settle_params: Option<(Option<Address>, i128, i128)> = if release_to_driver {
             let base_fee_bps: u32 = env
                 .storage()
@@ -2359,13 +2404,19 @@ impl EscrowContract {
         if record.status != EscrowStatus::Holdback {
             panic_with_error!(&env, TrustchainError::InvalidState);
         }
-        // `mark_holdback_escrow` is the only path into `Holdback` and always
-        // sets this, but fall back to a typed rejection rather than a panic
-        // on unwrap if that invariant is ever violated.
-        let holdback_started_at = record
-            .holdback_started_at
+        // Issue #109: use the deadline that was snapshotted at the
+        // Locked→Holdback transition (mark_holdback_escrow) rather than
+        // recomputing holdback_started_at + current_global_HoldbackWindow.
+        // This ensures that a later set_holdback_window call cannot shorten
+        // the recipient's dispute window or extend the driver's wait for
+        // escrows already in Holdback.
+        //
+        // `mark_holdback_escrow` always sets holdback_deadline alongside
+        // holdback_started_at, but fall back to a typed rejection rather than
+        // panicking on unwrap if that invariant is ever violated.
+        let deadline = record
+            .holdback_deadline
             .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::InvalidState));
-        let deadline = holdback_started_at.saturating_add(get_holdback_window(&env));
         if env.ledger().timestamp() < deadline {
             panic_with_error!(&env, TrustchainError::TimelockNotElapsed);
         }

@@ -194,7 +194,9 @@ impl MockEscrowContract {
             disputed_by: None,
             disputed_at: None,
             holdback_started_at: None,
+            holdback_deadline: None,
             fleet_id: None,
+            locked_fee_bps: 0,
         }
     }
 
