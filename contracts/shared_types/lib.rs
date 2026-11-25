@@ -121,6 +121,8 @@ pub mod events {
     pub const ADMIN_TRANSFERRED: &str = "admin_transferred";
     pub const PROTOCOL_PAUSE_STATUS_CHANGED: &str = "protocol_pause_status_changed";
     pub const DELIVERY_CONTRACT_INITIALIZED: &str = "delivery_contract_initialized";
+    /// Emitted by `settlement_contract::set_swap_router` (Issue #132).
+    pub const SWAP_ROUTER_UPDATED: &str = "swap_router_updated";
 
     pub fn delivery_created(env: &Env) -> Symbol {
         Symbol::new(env, DELIVERY_CREATED)
@@ -353,6 +355,10 @@ pub mod events {
 
     pub fn admin_transferred(env: &Env) -> Symbol {
         Symbol::new(env, ADMIN_TRANSFERRED)
+    }
+
+    pub fn swap_router_updated(env: &Env) -> Symbol {
+        Symbol::new(env, SWAP_ROUTER_UPDATED)
     }
 
     pub fn admin_proposed(env: &Env) -> Symbol {
@@ -748,6 +754,20 @@ pub struct EscrowContractUpdatedEvent {
     pub admin: Address,
     /// New escrow contract address.
     pub new_escrow: Address,
+}
+
+/// Emitted by `settlement_contract::set_swap_router` every time the privileged
+/// swap-router address changes so off-chain monitors can observe routing changes
+/// without polling storage (Issue #132).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SwapRouterUpdatedEvent {
+    /// Admin address that performed the update.
+    pub admin: Address,
+    /// Previous router address (`None` when no router was configured before).
+    pub old_router: Option<Address>,
+    /// New router address.
+    pub new_router: Address,
 }
 
 #[contracttype]
@@ -1603,6 +1623,7 @@ mod test {
             ADMIN_TRANSFERRED => admin_transferred,
             PROTOCOL_PAUSE_STATUS_CHANGED => protocol_pause_status_changed,
             DELIVERY_CONTRACT_INITIALIZED => delivery_contract_initialized,
+            SWAP_ROUTER_UPDATED => swap_router_updated,
         }
     }
 }

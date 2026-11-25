@@ -337,6 +337,9 @@ pub enum DataKey {
     /// Persistent key — one active roster entry, keyed by fleet and index.
     /// Always renewed together with the matching `DriverFleet` record.
     FleetRoster(u64, u32),
+    /// Persistent key — the roster slot index for an active driver, enabling
+    /// O(1) removal without a linear scan (Issue #125).
+    DriverRosterIndex(u64, Address),
     /// Persistent key — pending, not-yet-confirmed treasury change for a fleet.
     PendingTreasury(u64),
     /// Persistent key — pending admin-proposed owner reassignment for a fleet.
@@ -1304,6 +1307,15 @@ impl FleetManagementContract {
         // Membership and roster slot start with the same lifetime.
         renew_active_membership(&env, fleet_id, &driver, roster_index);
 
+        // Record the driver's slot index so removal is O(1) (Issue #125).
+        let index_key = DataKey::DriverRosterIndex(fleet_id, driver.clone());
+        env.storage().persistent().set(&index_key, &roster_slot);
+        env.storage().persistent().extend_ttl(
+            &index_key,
+            ttl::LEDGER_TTL_THRESHOLD,
+            ttl::LEDGER_TTL_EXTEND_TO,
+        );
+
         // Emit event.
         env.events().publish(
             (events::invite_accepted(&env),),
@@ -1344,6 +1356,14 @@ impl FleetManagementContract {
         // The caller must sign this transaction.
         caller.require_auth();
         require_escrow_not_paused(&env);
+
+        // Issue #123: a deactivated fleet's membership is frozen.
+        // Drivers cannot be removed from an inactive fleet — both owner-
+        // initiated and driver self-exit removals are blocked to keep the
+        // historical roster immutable after shutdown.
+        if !profile.active {
+            panic_with_error!(&env, FleetError::FleetInactive);
+        }
 
         // Verify caller is authorised: must be either an authorized signer or the driver.
         let is_driver = caller == driver;
@@ -1405,28 +1425,22 @@ impl FleetManagementContract {
             ttl::LEDGER_TTL_EXTEND_TO,
         );
 
-        // Remove the driver from the indexed roster and compact the remaining
-        // entries so enumeration stays contiguous without rewriting one large value.
+        // Remove the driver from the indexed roster using the stored slot index
+        // so removal is O(1) regardless of roster size (Issue #125). No
+        // linear scan is needed.
         if status == DriverFleetStatus::Active {
             let roster_len = profile.total_active_drivers + 1;
-            let mut removed_index = None;
-            for index in 0..roster_len {
-                let roster_key = DataKey::FleetRoster(fleet_id, index);
-                if env
-                    .storage()
-                    .persistent()
-                    .get::<_, Address>(&roster_key)
-                    .is_some_and(|existing| existing == driver)
-                {
-                    removed_index = Some(index);
-                    break;
-                }
-            }
+            let index_key = DataKey::DriverRosterIndex(fleet_id, driver.clone());
+            let removed_index: Option<u32> = env.storage().persistent().get(&index_key);
 
             if let Some(index) = removed_index {
+                // Remove the now-stale index entry for this driver.
+                env.storage().persistent().remove(&index_key);
+
                 let last_index = roster_len - 1;
                 if index != last_index {
-                    // Swap the last driver into the removed slot.
+                    // Swap the last driver into the removed slot and update
+                    // their index entry so future removals remain O(1).
                     let last_key = DataKey::FleetRoster(fleet_id, last_index);
                     let removed_slot_key = DataKey::FleetRoster(fleet_id, index);
                     let last_driver: Address = env
@@ -1686,6 +1700,15 @@ impl FleetManagementContract {
         }
 
         if threshold == 0 || threshold > signers.len() {
+            panic_with_error!(&env, FleetError::InvalidConfiguration);
+        }
+
+        // Issue #124: the fleet owner must be a member of the signer set so
+        // they always retain a path to update signers again. A signer set that
+        // excludes the owner would require co-signer authorization for every
+        // future `configure_signers` call; if those keys become unavailable the
+        // owner permanently loses governance control.
+        if !unique_signers.contains(&profile.owner) {
             panic_with_error!(&env, FleetError::InvalidConfiguration);
         }
 
