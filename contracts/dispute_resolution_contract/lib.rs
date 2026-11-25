@@ -3,7 +3,7 @@
 use shared_types::{
     events, ttl, DeliveryId, DeliveryStatus, DisputeRaisedEvent, DisputeResolvedPayoutEvent,
     DisputeResolvedRefundEvent, DisputeResolvedSplitEvent, EscrowRecord, EscrowStatus,
-    TrustchainError, PendingPeerContractChange,
+    TrustchainError, PendingPeerContractChange, HIGH_VALUE_DISPUTE_THRESHOLD,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, Address, BytesN, Env, IntoVal, Symbol,
@@ -230,7 +230,7 @@ impl DisputeResolutionContract {
         escrow_amount: i128,
         verdict: ResolutionVerdict,
     ) -> bool {
-        if escrow_amount < HIGH_VALUE_DISPUTE_THRESHOLD {
+        if escrow_amount < shared_types::HIGH_VALUE_DISPUTE_THRESHOLD {
             return true;
         }
 
@@ -286,6 +286,9 @@ impl DisputeResolutionContract {
             panic_with_error!(&env, TrustchainError::AlreadyInitialized);
         }
         admin.require_auth();
+        // Issue #94: admin, delivery_contract and escrow_contract must all be
+        // distinct, non-self addresses before any is persisted.
+        shared_types::validate_init_addresses(&env, &[&admin, &delivery_contract, &escrow_contract]);
         if !(MIN_DISPUTE_TIME_LIMIT..=MAX_DISPUTE_WINDOW).contains(&dispute_time_limit) {
             panic_with_error!(&env, TrustchainError::InvalidState);
         }
@@ -542,16 +545,16 @@ impl DisputeResolutionContract {
                 activates_at,
             },
         );
-        env.storage()
-            .instance()
-            .set(&DataKey::DeliveryContract, &delivery_contract);
+        // The live pointer is only replaced by `confirm_delivery_contract`
+        // once the timelock has elapsed; writing it here would bypass the
+        // review period entirely.
         env.storage()
             .instance()
             .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
         // #382 precedent: emit an event so off-chain indexers can track when
         // this contract pointer is proposed by an admin.
         env.events().publish(
-            (Symbol::new(&env, "delivery_contract_change_proposed"),),
+            (Symbol::new(&env, "delivery_contract_proposed"),),
             (caller, delivery_contract, activates_at),
         );
     }
@@ -576,7 +579,7 @@ impl DisputeResolutionContract {
             .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
         env.events().publish(
             (Symbol::new(&env, "delivery_contract_set"),),
-            (pending.proposed_by, pending.address),
+            (caller, escrow_contract),
         );
     }
 
@@ -606,15 +609,92 @@ impl DisputeResolutionContract {
                 activates_at,
             },
         );
-        env.storage()
-            .instance()
-            .set(&DataKey::EscrowContract, &escrow_contract);
+        // The live pointer is only replaced by `confirm_escrow_contract` once
+        // the timelock has elapsed.
         env.storage()
             .instance()
             .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
         env.events().publish(
-            (Symbol::new(&env, "escrow_contract_set"),),
-            (pending.proposed_by, pending.address),
+            (Symbol::new(&env, "escrow_contract_change_proposed"),),
+            (caller, escrow_contract, activates_at),
+        );
+    }
+
+    /// Activate the pending escrow contract once its timelock has elapsed.
+    /// Callable by anyone: the change was already authorized by an admin in
+    /// `set_escrow_contract` and the timelock is the review window.
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn confirm_escrow_contract(env: Env) {
+        let pending: PendingPeerContractChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingEscrowContract)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NoPendingContractChange));
+        if env.ledger().timestamp() < pending.activates_at {
+            panic_with_error!(&env, TrustchainError::ContractChangeTimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &pending.address);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingEscrowContract);
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "escrow_contract_change_proposed"),),
+            (caller, escrow_contract, activates_at),
+        );
+    }
+
+    #[allow(deprecated)]
+    pub fn confirm_escrow_contract(env: Env) {
+        let pending: PendingPeerContractChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingEscrowContract)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NoPendingContractChange));
+        if env.ledger().timestamp() < pending.activates_at {
+            panic_with_error!(&env, TrustchainError::ContractChangeTimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &pending.address);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingEscrowContract);
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "escrow_contract_change_proposed"),),
+            (caller, escrow_contract, activates_at),
+        );
+    }
+
+    #[allow(deprecated)] // events().publish() is deprecated in SDK 27.0.0 but still functional; tracked in SOROBAN_SDK_27_MIGRATION.md#event-system-migration (Issue #114)
+    pub fn confirm_escrow_contract(env: Env) {
+        let pending: PendingPeerContractChange = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingEscrowContract)
+            .unwrap_or_else(|| panic_with_error!(&env, TrustchainError::NoPendingContractChange));
+        if env.ledger().timestamp() < pending.activates_at {
+            panic_with_error!(&env, TrustchainError::ContractChangeTimelockNotElapsed);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::EscrowContract, &pending.address);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingEscrowContract);
+        env.storage()
+            .instance()
+            .extend_ttl(ttl::LEDGER_TTL_THRESHOLD, ttl::LEDGER_TTL_EXTEND_TO);
+        env.events().publish(
+            (Symbol::new(&env, "escrow_contract_change_proposed"),),
+            (caller, escrow_contract, activates_at),
         );
     }
 
