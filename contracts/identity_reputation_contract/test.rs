@@ -231,7 +231,7 @@ fn test_decrease_reputation_basic() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    client.decrease_reputation(&delivery_contract, &driver, &10u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &10u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 40);
 }
@@ -242,7 +242,7 @@ fn test_reputation_cannot_go_below_zero() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    client.decrease_reputation(&delivery_contract, &driver, &200u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &200u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 0);
 }
@@ -267,7 +267,7 @@ fn test_tier_bronze() {
     client.register_driver(&driver);
 
     client.increase_reputation(&delivery_contract, &driver, &1u64, &1000u32, &false);
-    client.decrease_reputation(&delivery_contract, &driver, &15u32);
+    client.decrease_reputation(&delivery_contract, &driver, &1u64, &15u32, &None);
     let tier = client.get_driver_tier(&driver);
     assert_eq!(tier, DriverTier::Bronze);
 }
@@ -331,10 +331,10 @@ fn drive_score_to(
             score += 5;
         }
         if score > target {
-            client.decrease_reputation(authorized, driver, &(score - target));
+            client.decrease_reputation(authorized, driver, &0u64, &(score - target), &None);
         }
     } else {
-        client.decrease_reputation(authorized, driver, &(start - target));
+        client.decrease_reputation(authorized, driver, &0u64, &(start - target), &None);
     }
     assert_eq!(
         client.get_driver_profile(driver).reputation_score,
@@ -449,9 +449,9 @@ fn test_reputation_deduction_sequence() {
     client.register_driver(&driver);
 
     client.increase_reputation(&delivery_contract, &driver, &1u64, &6000u32, &true);
-    client.decrease_reputation(&dispute_contract, &driver, &3u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &3u32, &None);
     client.increase_reputation(&delivery_contract, &driver, &2u64, &1000u32, &false);
-    client.decrease_reputation(&dispute_contract, &driver, &7u32);
+    client.decrease_reputation(&dispute_contract, &driver, &2u64, &7u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 55);
@@ -576,7 +576,7 @@ fn test_admin_can_repoint_cross_contracts() {
     assert_eq!(client.get_dispute_contract(), new_dispute_contract);
 
     client.increase_reputation(&new_delivery_contract, &driver, &1u64, &1000u32, &false);
-    client.decrease_reputation(&new_dispute_contract, &driver, &2u32);
+    client.decrease_reputation(&new_dispute_contract, &driver, &1u64, &2u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 53);
@@ -673,7 +673,7 @@ fn test_authorized_third_contract_can_update_reputation() {
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 55);
 
-    client.decrease_reputation(&third_contract, &driver, &5u32);
+    client.decrease_reputation(&third_contract, &driver, &1u64, &5u32, &None);
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.reputation_score, 50);
 }
@@ -746,7 +746,8 @@ fn test_deauthorized_delivery_contract_rejected_for_reputation_calls() {
         _ => panic!("Expected de-authorized increase_reputation to fail with Unauthorized"),
     }
 
-    let dec_result = client.try_decrease_reputation(&delivery_contract, &driver, &5u32);
+    let dec_result =
+        client.try_decrease_reputation(&delivery_contract, &driver, &1u64, &5u32, &None);
     match dec_result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected de-authorized decrease_reputation to fail with Unauthorized"),
@@ -790,7 +791,7 @@ fn test_unauthorized_caller_cannot_decrease_reputation() {
     let driver = Address::generate(&env);
     client.register_driver(&driver);
 
-    let result = client.try_decrease_reputation(&random, &driver, &5u32);
+    let result = client.try_decrease_reputation(&random, &driver, &1u64, &5u32, &None);
     match result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected unauthorized decrease_reputation to fail with Unauthorized"),
@@ -1227,7 +1228,7 @@ fn test_suspended_driver_still_receives_penalties() {
     client.register_driver(&driver);
     client.suspend_driver(&admin, &driver);
 
-    client.decrease_reputation(&dispute_contract, &driver, &10u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &10u32, &None);
     assert_eq!(client.get_driver_profile(&driver).reputation_score, 40);
 }
 
@@ -1286,7 +1287,7 @@ fn test_existing_flows_unaffected_for_active_drivers() {
     client.register_driver(&driver);
     client.update_driver_kyc_status(&admin, &driver, &true);
     client.increase_reputation(&delivery_contract, &driver, &1u64, &6000u32, &true);
-    client.decrease_reputation(&dispute_contract, &driver, &3u32);
+    client.decrease_reputation(&dispute_contract, &driver, &1u64, &3u32, &None);
 
     let profile = client.get_driver_profile(&driver);
     assert_eq!(profile.kyc_verified, true);
