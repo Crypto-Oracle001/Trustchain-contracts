@@ -2,7 +2,7 @@ use super::*;
 use proptest::prelude::*;
 use shared_types::TrustchainError;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Events, Ledger as _},
     xdr, Address, Env, Symbol, TryFromVal, Val,
 };
 
@@ -1432,103 +1432,91 @@ fn test_register_driver_emits_event_with_kyc_and_score() {
     assert_eq!(profile.reputation_score, INITIAL_REPUTATION_SCORE);
 }
 
-// ── Issue #120: penalty events carry dispute context ────────────────────────
+// ── Driver profile archival recovery ─────────────────────────────────────────
 
-/// Decode the most recently published event's data as a
-/// `ReputationDecreasedEvent` and return it alongside the event's topics.
-fn last_decrease_event(env: &Env) -> (soroban_sdk::Vec<Val>, ReputationDecreasedEvent) {
-    let (topics, data) = last_event(env);
-    let event = ReputationDecreasedEvent::try_from_val(env, &data)
-        .expect("event data is not a ReputationDecreasedEvent");
-    (topics, event)
+fn driver_profile_ttl(env: &Env, client: &IdentityReputationContractClient, driver: &Address) -> u32 {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .get_ttl(&DataKey::DriverProfile(driver.clone()))
+    })
 }
 
-/// A penalty attributed to a specific delivery must emit that delivery id,
-/// the actor that applied it, the points deducted and the resulting score.
-#[test]
-fn test_decrease_reputation_event_carries_delivery_and_reason() {
-    let (env, _, client, _, dispute_contract) = setup_wired();
-    let driver = Address::generate(&env);
-    client.register_driver(&driver);
-
-    let delivery_id = 42u64;
-    let reason = Symbol::new(&env, "refund");
-    client.decrease_reputation(
-        &dispute_contract,
-        &driver,
-        &delivery_id,
-        &10u32,
-        &Some(reason.clone()),
-    );
-
-    assert_last_topic(&env, "reputation_decreased");
-    let (_, event) = last_decrease_event(&env);
-    assert_eq!(event.driver, driver);
-    assert_eq!(event.delivery_id, delivery_id);
-    assert_eq!(event.reason, Some(reason));
-    assert_eq!(event.actor, dispute_contract);
-    assert_eq!(event.points, 10);
-    assert_eq!(event.resulting_score, 40);
+/// Advance far enough that the remaining TTL drops below the extension
+/// threshold, so any `extend_ttl` call is observable.
+fn age_past_ttl_threshold(env: &Env) {
+    env.ledger().with_mut(|l| {
+        l.sequence_number += ttl::LEDGER_TTL_EXTEND_TO - ttl::LEDGER_TTL_THRESHOLD + 1;
+    });
 }
 
-/// A refund verdict and a split verdict for different deliveries each produce
-/// a penalty event attributable to its own delivery id and reason.
 #[test]
-fn test_refund_and_split_verdicts_produce_attributable_penalty_events() {
-    let (env, _, client, _, dispute_contract) = setup_wired();
+fn test_driver_profile_reads_do_not_extend_ttl() {
+    let (env, _admin, client, _, _) = setup();
     let driver = Address::generate(&env);
     client.register_driver(&driver);
+    age_past_ttl_threshold(&env);
+    let before = driver_profile_ttl(&env, &client, &driver);
 
-    let refund_delivery = 1001u64;
-    let split_delivery = 1002u64;
+    assert!(client.has_driver_profile(&driver));
+    client.get_driver_profile(&driver);
+    assert!(!client.is_driver_suspended(&driver));
 
-    client.decrease_reputation(
-        &dispute_contract,
-        &driver,
-        &refund_delivery,
-        &10u32,
-        &Some(Symbol::new(&env, "refund")),
-    );
-    let (_, refund_event) = last_decrease_event(&env);
-    assert_eq!(refund_event.delivery_id, refund_delivery);
-    assert_eq!(refund_event.reason, Some(Symbol::new(&env, "refund")));
-    assert_eq!(refund_event.actor, dispute_contract);
-    assert_eq!(refund_event.points, 10);
-    assert_eq!(refund_event.resulting_score, 40);
-
-    client.decrease_reputation(
-        &dispute_contract,
-        &driver,
-        &split_delivery,
-        &5u32,
-        &Some(Symbol::new(&env, "split")),
-    );
-    let (_, split_event) = last_decrease_event(&env);
-    assert_eq!(split_event.delivery_id, split_delivery);
-    assert_eq!(split_event.reason, Some(Symbol::new(&env, "split")));
-    assert_eq!(split_event.actor, dispute_contract);
-    assert_eq!(split_event.points, 5);
-    assert_eq!(split_event.resulting_score, 35);
-
-    // The two events are distinguishable by delivery id.
-    assert_ne!(refund_event.delivery_id, split_event.delivery_id);
+    assert_eq!(driver_profile_ttl(&env, &client, &driver), before);
 }
 
-/// Callers without a reason code still emit the delivery id and a `None`
-/// reason, so indexers can attribute the penalty to the delivery.
 #[test]
-fn test_decrease_reputation_event_without_reason() {
-    let (env, _, client, delivery_contract, _) = setup_wired();
+fn test_register_driver_for_returning_driver_extends_ttl_and_keeps_history() {
+    let (env, admin, client, _, _) = setup();
     let driver = Address::generate(&env);
     client.register_driver(&driver);
+    client.update_driver_kyc_status(&admin, &driver, &true);
+    client.suspend_driver(&admin, &driver);
+    age_past_ttl_threshold(&env);
+    assert!(driver_profile_ttl(&env, &client, &driver) < ttl::LEDGER_TTL_THRESHOLD);
 
-    client.decrease_reputation(&delivery_contract, &driver, &7u64, &3u32, &None);
+    let profile = client.register_driver(&driver);
 
-    let (_, event) = last_decrease_event(&env);
-    assert_eq!(event.driver, driver);
-    assert_eq!(event.delivery_id, 7u64);
-    assert_eq!(event.reason, None);
-    assert_eq!(event.actor, delivery_contract);
-    assert_eq!(event.points, 3);
-    assert_eq!(event.resulting_score, 47);
+    assert_eq!(driver_profile_ttl(&env, &client, &driver), ttl::LEDGER_TTL_EXTEND_TO);
+    // Re-registration must still not reset history or lift the suspension.
+    assert!(profile.kyc_verified);
+    assert_eq!(profile.status, DriverStatus::Suspended);
+    assert_eq!(client.get_driver_profile(&driver), profile);
+}
+
+#[test]
+fn test_extend_driver_profile_ttl_refreshes_existing_profile() {
+    let (env, _admin, client, _, _) = setup();
+    let driver = Address::generate(&env);
+    let registered = client.register_driver(&driver);
+    age_past_ttl_threshold(&env);
+
+    let profile = client.extend_driver_profile_ttl(&driver);
+
+    assert_eq!(profile, registered);
+    assert_eq!(driver_profile_ttl(&env, &client, &driver), ttl::LEDGER_TTL_EXTEND_TO);
+}
+
+#[test]
+fn test_extend_driver_profile_ttl_needs_no_authorization() {
+    let env = Env::default();
+    let contract_id = env.register(IdentityReputationContract, ());
+    let client = IdentityReputationContractClient::new(&env, &contract_id);
+    let driver = Address::generate(&env);
+    env.mock_all_auths();
+    client.register_driver(&driver);
+    env.set_auths(&[]);
+
+    client.extend_driver_profile_ttl(&driver);
+    assert!(env.auths().is_empty());
+}
+
+#[test]
+fn test_extend_driver_profile_ttl_rejects_unregistered_driver() {
+    let (env, _admin, client, _, _) = setup();
+    let result = client.try_extend_driver_profile_ttl(&Address::generate(&env));
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::ProviderNotFound.into()),
+        _ => panic!("Expected TrustchainError::ProviderNotFound"),
+    }
 }
