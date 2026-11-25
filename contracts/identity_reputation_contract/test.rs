@@ -678,8 +678,9 @@ fn test_authorized_third_contract_can_update_reputation() {
     assert_eq!(profile.reputation_score, 50);
 }
 
-/// set_authorized_contract(false) revokes a previously-authorized caller; any
-/// subsequent reputation call from that address must be rejected.
+/// Confirming a delivery peer rotation revokes the superseded caller; any
+/// subsequent reputation call from that address must be rejected without any
+/// manual allowlist bookkeeping.
 #[test]
 fn test_deauthorized_caller_is_rejected() {
     let (env, admin, client, delivery_id, _) = setup_wired();
@@ -687,23 +688,138 @@ fn test_deauthorized_caller_is_rejected() {
     client.register_driver(&driver);
 
     // Repoint to a real replacement delivery contract (the pause guard
-    // resolves through the stored delivery address), then de-authorize the
-    // superseded original.
+    // resolves through the stored delivery address). Confirmation must revoke
+    // the superseded original automatically.
     let new_delivery_contract = new_delivery_contract_on_same_escrow(&env, &admin, &delivery_id);
     client.set_delivery_contract(&admin, &new_delivery_contract);
     env.ledger().set_timestamp(
         env.ledger().timestamp() + shared_types::PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS,
     );
     client.confirm_delivery_contract();
-    // Repointing alone doesn't revoke the old address — the allowlist is
-    // managed explicitly, so the supersession must be done here too.
-    client.set_authorized_contract(&admin, &delivery_id, &false);
+
+    assert!(client.is_authorized_contract(&new_delivery_contract));
+    assert!(!client.is_authorized_contract(&delivery_id));
 
     let result = client.try_increase_reputation(&delivery_id, &driver, &1u64, &1000u32, &false);
     match result {
         Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
         _ => panic!("Expected the superseded delivery contract to fail with Unauthorized"),
     }
+}
+
+// ── Issue #117: peer rotation keeps authorization in sync ───────────────────
+
+/// Rotating the delivery peer must atomically move the AuthorizedContract
+/// flag: the new peer is authorized for increase/decrease/award, the retired
+/// peer is rejected with `Unauthorized` on all three.
+#[test]
+fn test_delivery_rotation_moves_authorization() {
+    let (env, admin, client, old_delivery, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let new_delivery = new_delivery_contract_on_same_escrow(&env, &admin, &old_delivery);
+    client.set_delivery_contract(&admin, &new_delivery);
+    env.ledger().set_timestamp(
+        env.ledger().timestamp() + shared_types::PEER_CONTRACT_CHANGE_TIMELOCK_SECONDS,
+    );
+    client.confirm_delivery_contract();
+
+    // Allowlist agrees with the active peer address.
+    assert!(client.is_authorized_contract(&new_delivery));
+    assert!(!client.is_authorized_contract(&old_delivery));
+
+    // New peer can drive every reputation entry point.
+    client.increase_reputation(&new_delivery, &driver, &1u64, &1000u32, &false);
+    client.decrease_reputation(&new_delivery, &driver, &2u32);
+    client.award_reputation(&new_delivery, &driver, &3u32);
+    assert_eq!(client.get_driver_profile(&driver).reputation_score, 56);
+
+    // Retired peer is rejected on every reputation entry point.
+    let inc = client.try_increase_reputation(&old_delivery, &driver, &2u64, &1000u32, &false);
+    match inc {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired delivery peer to fail increase_reputation"),
+    }
+    let dec = client.try_decrease_reputation(&old_delivery, &driver, &5u32);
+    match dec {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired delivery peer to fail decrease_reputation"),
+    }
+    let award = client.try_award_reputation(&old_delivery, &driver, &5u32);
+    match award {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired delivery peer to fail award_reputation"),
+    }
+}
+
+/// Rotating the dispute peer must likewise move the AuthorizedContract flag:
+/// the new peer is authorized for increase/decrease/award, the retired peer is
+/// rejected with `Unauthorized` on all three.
+#[test]
+fn test_dispute_rotation_moves_authorization() {
+    let (env, admin, client, _, old_dispute) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let new_dispute = Address::generate(&env);
+    client.set_dispute_contract(&admin, &new_dispute);
+
+    // Allowlist agrees with the active peer address.
+    assert!(client.is_authorized_contract(&new_dispute));
+    assert!(!client.is_authorized_contract(&old_dispute));
+
+    // New peer can drive every reputation entry point.
+    client.increase_reputation(&new_dispute, &driver, &1u64, &1000u32, &false);
+    client.decrease_reputation(&new_dispute, &driver, &2u32);
+    client.award_reputation(&new_dispute, &driver, &3u32);
+    assert_eq!(client.get_driver_profile(&driver).reputation_score, 56);
+
+    // Retired peer is rejected on every reputation entry point.
+    let inc = client.try_increase_reputation(&old_dispute, &driver, &2u64, &1000u32, &false);
+    match inc {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired dispute peer to fail increase_reputation"),
+    }
+    let dec = client.try_decrease_reputation(&old_dispute, &driver, &5u32);
+    match dec {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired dispute peer to fail decrease_reputation"),
+    }
+    let award = client.try_award_reputation(&old_dispute, &driver, &5u32);
+    match award {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected retired dispute peer to fail award_reputation"),
+    }
+}
+
+/// A pending delivery proposal that has not been confirmed must not touch the
+/// allowlist: the current peer stays authorized and the proposed peer stays
+/// unauthorized until `confirm_delivery_contract` runs.
+#[test]
+fn test_pending_delivery_proposal_does_not_change_authorization() {
+    let (env, admin, client, old_delivery, _) = setup_wired();
+    let driver = Address::generate(&env);
+    client.register_driver(&driver);
+
+    let new_delivery = new_delivery_contract_on_same_escrow(&env, &admin, &old_delivery);
+    client.set_delivery_contract(&admin, &new_delivery);
+
+    // Proposal alone leaves the allowlist untouched.
+    assert!(client.is_authorized_contract(&old_delivery));
+    assert!(!client.is_authorized_contract(&new_delivery));
+
+    // The proposed peer cannot write reputation yet.
+    let result =
+        client.try_increase_reputation(&new_delivery, &driver, &1u64, &1000u32, &false);
+    match result {
+        Err(Ok(err)) => assert_eq!(err, TrustchainError::Unauthorized.into()),
+        _ => panic!("Expected unconfirmed delivery peer to fail with Unauthorized"),
+    }
+
+    // The still-active peer keeps working.
+    client.increase_reputation(&old_delivery, &driver, &1u64, &1000u32, &false);
+    assert_eq!(client.get_driver_profile(&driver).reputation_score, 55);
 }
 
 #[test]

@@ -128,6 +128,32 @@ fn require_driver_not_suspended(env: &Env, profile: &DriverProfile) {
     }
 }
 
+/// Atomically move reputation-writer authorization from `old_peer` to
+/// `new_peer`.
+///
+/// Peer rotation must keep the active peer address and the reputation
+/// allowlist in sync (Issue #117): the retired peer loses its
+/// `AuthorizedContract` flag in the same call that grants it to the
+/// replacement, so there is never a window where both (or neither) are
+/// authorized. Revocation of the replaced peer therefore takes effect
+/// immediately at confirmation time.
+fn rotate_authorized_peer(env: &Env, old_peer: &Address, new_peer: &Address) {
+    if old_peer == new_peer {
+        // No-op rotation: keep the existing grant untouched.
+        return;
+    }
+    env.storage()
+        .persistent()
+        .remove(&DataKey::AuthorizedContract(old_peer.clone()));
+    let key = DataKey::AuthorizedContract(new_peer.clone());
+    env.storage().persistent().set(&key, &true);
+    env.storage().persistent().extend_ttl(
+        &key,
+        ttl::LEDGER_TTL_THRESHOLD,
+        ttl::LEDGER_TTL_EXTEND_TO,
+    );
+}
+
 #[contract]
 pub struct IdentityReputationContract;
 
@@ -274,6 +300,20 @@ impl IdentityReputationContract {
         if env.ledger().timestamp() < pending.activates_at {
             panic_with_error!(&env, TrustchainError::ContractChangeTimelockNotElapsed);
         }
+        let old_delivery_contract: Option<Address> =
+            env.storage().instance().get(&DataKey::DeliveryContract);
+        if let Some(old_peer) = old_delivery_contract {
+            rotate_authorized_peer(&env, &old_peer, &pending.address);
+        } else {
+            // No previous peer recorded: grant the new peer directly.
+            let key = DataKey::AuthorizedContract(pending.address.clone());
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                ttl::LEDGER_TTL_THRESHOLD,
+                ttl::LEDGER_TTL_EXTEND_TO,
+            );
+        }
         env.storage()
             .instance()
             .set(&DataKey::DeliveryContract, &pending.address);
@@ -301,6 +341,20 @@ impl IdentityReputationContract {
         admin.require_auth();
         if !is_admin(&env, &admin) {
             panic_with_error!(&env, TrustchainError::Unauthorized);
+        }
+        let old_dispute_contract: Option<Address> =
+            env.storage().instance().get(&DataKey::DisputeContract);
+        if let Some(old_peer) = old_dispute_contract {
+            rotate_authorized_peer(&env, &old_peer, &dispute_contract);
+        } else {
+            // No previous peer recorded: grant the new peer directly.
+            let key = DataKey::AuthorizedContract(dispute_contract.clone());
+            env.storage().persistent().set(&key, &true);
+            env.storage().persistent().extend_ttl(
+                &key,
+                ttl::LEDGER_TTL_THRESHOLD,
+                ttl::LEDGER_TTL_EXTEND_TO,
+            );
         }
         env.storage()
             .instance()
